@@ -4,7 +4,6 @@ x-instageo-backend-service-defaults: &backend-defaults
     - REDIS_HOST=${REDIS_HOST}
     - REDIS_PORT=${REDIS_PORT}
     - REDIS_DB=${REDIS_DB}
-    - TEST_FILEPATH=${TEST_FILEPATH}
     - AUTH0_DOMAIN=${AUTH0_DOMAIN}
     - AUTH0_AUDIENCE=${AUTH0_AUDIENCE}
     - DATABASE_URL=${DATABASE_URL}

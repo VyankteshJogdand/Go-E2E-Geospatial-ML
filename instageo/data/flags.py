@@ -38,12 +38,24 @@ flags.DEFINE_string(
 flags.DEFINE_integer(
     "num_steps",
     3,
-    """Number of temporal steps. When `is_time_series_task` is set to True, an attempt
-    will be made to retrieve `num_steps` chips prior to the observation date.
-    Otherwise, the value of `num_steps` will default to 1 and an attempt will be made to retrieve
-    the chip corresponding to the observation date.
-    """,
+    "Number of temporal steps to retrieve around or before the observation date.",
     lower_bound=1,
+)
+flags.DEFINE_boolean(
+    "shift_to_month_start",
+    True,
+    "Shift the observation date to the beginning of the month before computing"
+    " input_features_date.",
+)
+flags.DEFINE_boolean(
+    "is_forecasting_task",
+    True,
+    """If True, input imagery is fetched from before the observation date
+    (input_features_date = date - temporal_step). Suited for forecasting tasks
+    where the label is at time T but features come from prior timesteps.
+    If False, imagery is co-temporal with the observation (input_features_date = date).
+    num_steps is independent and controls how many timesteps are fetched in either case.
+    """,
 )
 flags.DEFINE_integer(
     "temporal_step",

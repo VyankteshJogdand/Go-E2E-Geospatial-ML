@@ -296,7 +296,10 @@ class RayEvaluationPipeline:
 
         elif self.config.mode == "chip_inference":
             output_dir = os.path.join(self.config.root_dir, "predictions")
-            results = self.model_server_handle.chip_inference.remote(test_loader, output_dir)
+            stitching = (self.parameters or {}).get("stitching", False)
+            results = self.model_server_handle.chip_inference.remote(
+                test_loader, output_dir, stitching
+            )
             results = results.result()
             # Ensure results is a dictionary
             if isinstance(results, dict):

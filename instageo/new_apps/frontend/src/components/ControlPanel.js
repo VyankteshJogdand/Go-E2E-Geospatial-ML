@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { Drawer, Box, Typography, Select, MenuItem, FormControl, InputLabel, Slider, Button, TextField, CircularProgress, Tooltip, IconButton, Collapse, Divider, Paper, Chip, InputAdornment, FormControlLabel, Switch } from '@mui/material';
+import { Drawer, Box, Typography, Select, MenuItem, FormControl, InputLabel, Slider, Button, TextField, CircularProgress, Tooltip, IconButton, Collapse, Divider, Paper, Chip, InputAdornment, FormControlLabel, Switch, Link } from '@mui/material';
 import { DatePicker } from '@mui/x-date-pickers/DatePicker';
 import { LocalizationProvider } from '@mui/x-date-pickers/LocalizationProvider';
 import { AdapterDayjs } from '@mui/x-date-pickers/AdapterDayjs';
@@ -8,7 +8,7 @@ import dayjs from 'dayjs';
 import InfoOutlinedIcon from '@mui/icons-material/InfoOutlined';
 import RefreshIcon from '@mui/icons-material/Refresh';
 import HelpOutlineIcon from '@mui/icons-material/HelpOutline';
-import { DEFAULT_TASK_PARAMS, PARAMS_HELP, LOGO_PATHS } from '../constants';
+import { DEFAULT_TASK_PARAMS, PARAMS_HELP, LOGO_PATHS, STITCHING_GITHUB_URL } from '../constants';
 import { logger } from '../utils/logger';
 import { fetchModelsWithTTL, clearModelsCache } from '../utils/modelsCache';
 import ProfileMenu from './ProfileMenu';
@@ -31,6 +31,7 @@ const ControlPanel = ({ open, onClose, hasBoundingBox, onRunModel, isProcessing,
     temporal_tolerance: false,
     cloud_coverage: false,
     mask_cloud: false,
+    stitching: false,
   });
 
 
@@ -431,6 +432,25 @@ const ControlPanel = ({ open, onClose, hasBoundingBox, onRunModel, isProcessing,
         <Collapse in={helpOpen.mask_cloud}>
           <Typography variant="caption" color="text.secondary">
             {PARAMS_HELP.mask_cloud}
+          </Typography>
+        </Collapse>
+
+        <FormControlLabel
+          control={<Switch checked={params.stitching} onChange={(e) => handleParamChange('stitching', e.target.checked)} />}
+          label="Apply post-processing"
+        />
+        <Tooltip title="More info">
+          <IconButton size="small" onClick={() => setHelpOpen(prev => ({ ...prev, stitching: !prev.stitching }))}>
+            <InfoOutlinedIcon fontSize="inherit" />
+          </IconButton>
+        </Tooltip>
+        <Collapse in={helpOpen.stitching}>
+          <Typography variant="caption" color="text.secondary" component="span" sx={{ display: 'block' }}>
+            {PARAMS_HELP.stitching} See the{' '}
+            <Link href={STITCHING_GITHUB_URL} target="_blank" rel="noopener noreferrer">
+              seamless-seg project on GitHub
+            </Link>
+            .
           </Typography>
         </Collapse>
 

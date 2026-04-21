@@ -16,39 +16,32 @@
 #
 # For more details, see https://creativecommons.org/licenses/by-nc-sa/4.0/
 # ------------------------------------------------------------------------------
-"""InstaGeo Chip Creator from Raster Module."""
+"""InstaGeo Chip Creator from Raster Module.
+
+This module creates chips from raster-based label data or bounding boxes.
+"""
 
 import json
 import logging as pylogging
-import os
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 import geopandas as gpd
-import pandas as pd
 from absl import app, flags, logging
-from pystac_client import Client
 
 from instageo.data import geo_utils
-from instageo.data.flags import FLAGS  # Import flags from central location
-from instageo.data.hls_utils import HLSRasterPipeline, add_hls_stac_items
-from instageo.data.s2_utils import S2RasterPipeline, add_s2_stac_items
-from instageo.data.settings import HLSAPISettings, S2APISettings
-from instageo.data.stac_utils import create_records_with_items
-
-# Create instances of the settings classes
-HLS_API = HLSAPISettings()
-S2_API = S2APISettings()
+from instageo.data.base_chip_creator import BaseChipCreator
+from instageo.data.flags import FLAGS
 
 logging.set_verbosity(logging.INFO)
 log = pylogging.getLogger(__name__)
 log.setLevel(pylogging.WARNING)
 pylogging.getLogger("botocore.credentials").setLevel(pylogging.WARNING)
-pylogging.getLogger("earthdata").setLevel(pylogging.WARNING)
+pylogging.getLogger("earthaccess").setLevel(pylogging.WARNING)
 
+# Define flags specific to raster-based chip creation
 flags.DEFINE_string("records_file", None, "Path to input records file containing geometries.")
 flags.DEFINE_string("raster_path", None, "Path to input raster file.")
-
 
 flags.DEFINE_bool(
     "qa_check", True, "Whether to perform quality assurance check on chip and seg_map."
@@ -69,136 +62,65 @@ flags.DEFINE_string(
 flags.DEFINE_string("date", None, "Date of the observations.")
 
 
-# TODO: Unify the code with the chip_creator.py file
-# TODO: Handle Sentinel-1 data
+class RasterBasedChipCreator(BaseChipCreator):
+    """Chip creator for raster-based label data.
+
+    This class handles chip creation from:
+    1. Existing raster files with labels
+    2. Bounding box feature files (generates grid polygons)
+    """
+
+    def get_input_type(self) -> Literal["point", "raster"]:
+        """Return input type for factory.
+
+        Returns:
+            "raster" to select raster-based pipelines
+        """
+        return "raster"
+
+    def get_observations(self) -> gpd.GeoDataFrame:
+        """Load observations from raster records or bounding box features.
+
+        Returns:
+            GeoDataFrame with observation records including geometry
+        """
+        if self.flags.is_bbox_feature:
+            # Create grid polygons from bounding box features
+            with open(self.flags.bbox_feature_path) as json_file:
+                bb_feature = json.load(json_file)
+
+            obsv_records = geo_utils.create_grid_polygons(
+                bbox_list=bb_feature,
+                date=self.flags.date
+                if self.flags.date
+                else datetime.strftime(datetime.now(), "%d-%m-%Y"),
+                chip_size=self.flags.chip_size,
+                spatial_resolution=self.flags.spatial_resolution,
+                crs=self.flags.src_crs,
+            )
+        else:
+            # Load from records file
+            obsv_records = gpd.read_file(self.flags.records_file)
+            obsv_records["geometry_4326"] = obsv_records["geometry"].to_crs("EPSG:4326")
+            obsv_records = self.apply_date_offsets(obsv_records)
+
+        return obsv_records
+
+
 def main(argv: Any) -> None:
     """Raster Chip Creator.
 
-    Given raster file containing label information, the Raster Chip Creator creates small chip from
-    larger satellite tiles which is suitable for training segmentation models.
+    Given a raster file containing label information, the Raster Chip Creator
+    creates small chips from larger satellite tiles which are suitable for
+    training segmentation models.
+
+    Supports all data sources: HLS, S2, and S1.
     """
     del argv
-    if FLAGS.is_bbox_feature:
-        with open(FLAGS.bbox_feature_path) as json_file:
-            bb_feature = json.load(json_file)
-        obsv_records = geo_utils.create_grid_polygons(
-            bbox_list=bb_feature,
-            date=FLAGS.date if FLAGS.date else datetime.strftime(datetime.now(), "%d-%m-%Y"),
-            chip_size=FLAGS.chip_size,
-            spatial_resolution=FLAGS.spatial_resolution,
-            crs=FLAGS.src_crs,
-        )
-    else:
-        obsv_records = gpd.read_file(FLAGS.records_file)
-        obsv_records["geometry_4326"] = obsv_records["geometry"].to_crs("EPSG:4326")
-        obsv_records["date"] = pd.to_datetime(obsv_records["date"])
-    if FLAGS.data_source == "HLS":
-        if not (os.path.exists(os.path.join(FLAGS.output_directory, "hls_dataset.json"))):
-            logging.info("Creating HLS dataset JSON.")
-            logging.info("Retrieving HLS tile ID for each observation.")
-            os.makedirs(os.path.join(FLAGS.output_directory), exist_ok=True)
 
-            client = Client.open(HLS_API.URL)
-            obsv_records_with_hls_items = add_hls_stac_items(
-                client,
-                obsv_records,
-                num_steps=FLAGS.num_steps,
-                temporal_step=FLAGS.temporal_step,
-                temporal_tolerance=FLAGS.temporal_tolerance,
-                cloud_coverage=FLAGS.cloud_coverage,
-                daytime_only=FLAGS.daytime_only,
-            )
-            (
-                filtered_obsv_records,
-                hls_dataset,
-            ) = create_records_with_items(obsv_records_with_hls_items, "hls_granules", "hls_items")
-            with open(os.path.join(FLAGS.output_directory, "hls_dataset.json"), "w") as json_file:
-                json.dump(hls_dataset, json_file, indent=4)
-            filtered_obsv_records.to_file(
-                os.path.join(FLAGS.output_directory, "filtered_obsv_records.gpkg"),
-                driver="GPKG",
-            )
-        else:
-            logging.info("HLS dataset JSON already created")
-            with open(os.path.join(FLAGS.output_directory, "hls_dataset.json")) as json_file:
-                hls_dataset = json.load(json_file)
-            filtered_obsv_records = gpd.read_file(
-                os.path.join(FLAGS.output_directory, "filtered_obsv_records.gpkg")
-            )
-
-        hls_raster_pipeline = HLSRasterPipeline(
-            output_directory=FLAGS.output_directory,
-            chip_size=FLAGS.chip_size,
-            raster_path=FLAGS.raster_path,
-            mask_types=FLAGS.mask_types,
-            masking_strategy=FLAGS.masking_strategy,
-            src_crs=FLAGS.src_crs,
-            spatial_resolution=FLAGS.spatial_resolution,
-            qa_check=FLAGS.qa_check,
-            task_type=FLAGS.task_type,
-            is_bbox_feature=FLAGS.is_bbox_feature,
-        )
-
-        # Run HLS pipeline
-        hls_raster_pipeline.run(hls_dataset, filtered_obsv_records)
-
-    elif FLAGS.data_source == "S2":
-        if not (os.path.exists(os.path.join(FLAGS.output_directory, "s2_dataset.json"))):
-            logging.info("Creating S2 dataset JSON.")
-            logging.info("Retrieving S2 tile ID for each observation.")
-            os.makedirs(os.path.join(FLAGS.output_directory), exist_ok=True)
-
-            obsv_records = gpd.read_file(FLAGS.records_file)
-            obsv_records["geometry_4326"] = obsv_records["geometry"].to_crs("EPSG:4326")
-            obsv_records["date"] = pd.to_datetime(obsv_records["date"])
-
-            client = Client.open(S2_API.URL)
-            obsv_records_with_s2_items = add_s2_stac_items(
-                client,
-                obsv_records,
-                num_steps=FLAGS.num_steps,
-                temporal_step=FLAGS.temporal_step,
-                temporal_tolerance=FLAGS.temporal_tolerance,
-                cloud_coverage=FLAGS.cloud_coverage,
-                daytime_only=FLAGS.daytime_only,
-            )
-            (
-                filtered_obsv_records,
-                s2_dataset,
-            ) = create_records_with_items(obsv_records_with_s2_items, "s2_granules", "s2_items")
-            with open(os.path.join(FLAGS.output_directory, "s2_dataset.json"), "w") as json_file:
-                json.dump(s2_dataset, json_file, indent=4)
-            filtered_obsv_records.to_file(
-                os.path.join(FLAGS.output_directory, "filtered_obsv_records.gpkg"),
-                driver="GPKG",
-            )
-        else:
-            logging.info("S2 dataset JSON already created")
-            with open(os.path.join(FLAGS.output_directory, "s2_dataset.json")) as json_file:
-                s2_dataset = json.load(json_file)
-            filtered_obsv_records = gpd.read_file(
-                os.path.join(FLAGS.output_directory, "filtered_obsv_records.gpkg")
-            )
-
-        s2_raster_pipeline = S2RasterPipeline(
-            output_directory=FLAGS.output_directory,
-            chip_size=FLAGS.chip_size,
-            raster_path=FLAGS.raster_path,
-            mask_types=FLAGS.mask_types,
-            masking_strategy=FLAGS.masking_strategy,
-            src_crs=FLAGS.src_crs,
-            spatial_resolution=FLAGS.spatial_resolution,
-            qa_check=FLAGS.qa_check,
-        )
-
-        # Run s2 pipeline
-        s2_raster_pipeline.run(s2_dataset, filtered_obsv_records)
-
-    elif FLAGS.data_source == "S1":
-        raise NotImplementedError
-
-    else:
-        raise NotImplementedError
+    # Create and run raster-based chip creator
+    creator = RasterBasedChipCreator(FLAGS)
+    creator.run()
 
 
 if __name__ == "__main__":

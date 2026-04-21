@@ -259,3 +259,7 @@ strict = false
 warn_redundant_casts = true
 disallow_untyped_defs = false
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "instageo.model.seamless_seg"
+ignore_errors = true

@@ -39,7 +39,8 @@ class COGConverter:
             no_data_value: No-data value to set in COG.
 
         Returns:
-            Tuple of (merged_chips_cog_path, merged_predictions_cog_path)
+            Dictionary with chips_merged_cog_path, predictions_merged_cog_path,
+            processing_duration, and segmentation_stats.
         """
         start_time = datetime.now()
         try:
@@ -58,7 +59,11 @@ class COGConverter:
             if not prediction_files:
                 raise ValueError(f"No prediction files found in {predictions_dir}")
 
-            logger.info(f"Starting parallel merge of {len(chip_files)} chips")
+            logger.info(
+                "Starting parallel merge of %s chips and %s prediction file(s)",
+                len(chip_files),
+                len(prediction_files),
+            )
 
             # Run chips and predictions merging in parallel
             with ThreadPoolExecutor(max_workers=2) as executor:

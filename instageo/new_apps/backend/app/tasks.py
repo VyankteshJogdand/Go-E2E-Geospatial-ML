@@ -641,6 +641,7 @@ def process_model_prediction_with_task(
             "CO2_emissions": results_dict.get("CO2_emissions"),  # type: ignore[union-attr]
             "energy_consumed": results_dict.get("energy_consumed"),  # type: ignore[union-attr]
             "inference_time": results_dict.get("inference_time"),  # type: ignore[union-attr]
+            "stitched": results_dict.get("stitched", False),
         }
 
         logger.info(f"Prediction results: {results_dict}")

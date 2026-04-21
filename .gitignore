@@ -147,7 +147,6 @@ nul/
 *.json
 *.csv
 .neptune/
-*.yaml
 *.ckpt
 *.gpkg
 

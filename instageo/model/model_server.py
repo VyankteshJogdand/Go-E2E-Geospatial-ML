@@ -88,21 +88,31 @@ class RayModelServer(Deployment):
             log.error(f"Evaluation failed: {str(e)}")
             raise
 
-    def chip_inference(self, test_loader: DataLoader, output_dir: str) -> Dict[str, Any]:
-        """Run chip-based inference and save results."""
+    def chip_inference(
+        self,
+        test_loader: DataLoader,
+        output_dir: str,
+        stitching: bool = False,
+    ) -> Dict[str, Any]:
+        """Run chip-based inference and save results.
+
+        When stitching=True, seamless-seg blending is applied and a single joined
+        prediction file is saved.
+        """
         if not self.model:
             raise RuntimeError("Model not initialized")
 
-        log.info(f"Starting chip inference, output dir: {output_dir}")
+        log.info(f"Starting chip inference, output dir: {output_dir}, stitching={stitching}")
         start_time = time.time()
 
         try:
             os.makedirs(output_dir, exist_ok=True)
-            emissions_data = chip_inference(
+            inference_result = chip_inference(
                 test_loader,
                 output_dir,
                 self.model,
                 self.device,
+                stitching=stitching,
             )
             inference_time = time.time() - start_time
             log.info(f"Chip inference completed in {inference_time:.2f}s")
@@ -120,9 +130,10 @@ class RayModelServer(Deployment):
 
         return {
             "status": "chip_inference_completed",
+            "stitched": inference_result.get("stitched", False),
             "model/GFLOPs": complexity["GFLOPs"],
-            "CO2_emissions": emissions_data.get("carbon/emissions (g CO₂)", "N/A"),
-            "energy_consumed": emissions_data.get("carbon/energy_consumed (kWh)", "N/A"),
+            "CO2_emissions": inference_result.get("carbon/emissions (g CO₂)", "N/A"),
+            "energy_consumed": inference_result.get("carbon/energy_consumed (kWh)", "N/A"),
             "inference_time": inference_time,
         }
 

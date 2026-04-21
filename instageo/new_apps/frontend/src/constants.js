@@ -4,6 +4,7 @@ export const DEFAULT_TASK_PARAMS = {
     temporal_tolerance: 10,
     cloud_coverage: 100,
     mask_cloud: false,
+    stitching: true,
     date: new Date().toISOString().split('T')[0],
 };
 
@@ -38,7 +39,10 @@ export const PARAMS_HELP = {
     temporal_tolerance: 'Allowed ± days around the selected date to search for usable imagery. Larger windows increase availability but may shift seasonal conditions.',
     cloud_coverage: 'Maximum acceptable percentage of cloud cover in the original tile from which the chips are extracted. Lower values yield clearer imagery but fewer candidates.',
     mask_cloud: 'Mask clouds from the input images. This will filter out pixels that are classified as clouds in the input images.',
+    stitching: 'When enabled, prediction uses the seamless-seg approach: the model is applied in a tiled, overlapping way and outputs are blended into a single continuous map. This avoids visible seams between chips and produces one joined prediction file instead of per-chip files.',
 };
+
+export const STITCHING_GITHUB_URL = 'https://github.com/Multihuntr/seamless-seg';
 
 export const HELP_DIALOG = {
     TITLE: 'Contact Support',

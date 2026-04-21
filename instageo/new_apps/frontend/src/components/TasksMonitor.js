@@ -847,6 +847,11 @@ const TasksMonitor = ({ open, onClose, onAddTaskLayer }) => {
                                                                                 ⚡ Energy consumed: {Number(stageData.result.energy_consumed).toFixed(10)} (kWh)
                                                                             </Typography>
                                                                         )}
+                                                                        {stageData.result.stitched !== undefined && (
+                                                                            <Typography variant="caption" display="block">
+                                                                                🧩 Post-processing: {stageData.result.stitched ? 'Applied' : 'Not applied'}
+                                                                            </Typography>
+                                                                        )}
                                                                         {stageData.result.inference_time !== undefined && (
                                                                             <Typography variant="caption" display="block">
                                                                                 ⏱️ Inference time: {Number(stageData.result.inference_time).toFixed(4)} s
@@ -872,7 +877,7 @@ const TasksMonitor = ({ open, onClose, onAddTaskLayer }) => {
 
                                                                 {/* Fallback for other results */}
                                                                 {!(stageName === 'data_processing' && (stageData.result.chips_created || stageData.result.processing_date)) &&
-                                                                 !(stageName === 'model_prediction' && (stageData.result["model/GFLOPs"] !== undefined || stageData.result.CO2_emissions !== undefined || stageData.result.energy_consumed !== undefined || stageData.result.inference_time !== undefined)) &&
+                                                                 !(stageName === 'model_prediction' && (stageData.result.stitched !== undefined || stageData.result["model/GFLOPs"] !== undefined || stageData.result.CO2_emissions !== undefined || stageData.result.energy_consumed !== undefined || stageData.result.inference_time !== undefined)) &&
                                                                  !(stageName === 'visualization_preparation' && stageData.result.processing_duration) && (
 
                                                                     <Typography variant="caption" display="block">

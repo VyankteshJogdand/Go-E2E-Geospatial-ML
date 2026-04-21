@@ -14,7 +14,7 @@ from instageo.data.stac_utils import (
     dispatch_candidate_items,
     find_best_items,
     find_closest_items,
-    get_raster_tile_info,
+    get_tile_info,
     is_daytime,
     is_valid_dataset_entry,
     rename_stac_items,
@@ -111,9 +111,9 @@ def sample_data():
     return gpd.GeoDataFrame(data, geometry="geometry_4326", crs="EPSG:4326")
 
 
-def test_get_raster_tile_info(sample_data):
+def test_get_tile_info(sample_data):
     """Test function output for expected behavior."""
-    tile_info, tile_queries = get_raster_tile_info(
+    tile_info, tile_queries = get_tile_info(
         sample_data, num_steps=2, temporal_step=5, temporal_tolerance=2
     )
 

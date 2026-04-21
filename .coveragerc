@@ -7,12 +7,14 @@ source =
 omit =
     */__init__.py
     *_test.py
+    */seamless_seg.py
 
 [report]
 omit =
     __init__.py
     *_test.py
     *app.py
+    */seamless_seg.py
 
 exclude_lines =
     # Don't complain if tests don't hit defensive assertion code:

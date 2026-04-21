@@ -178,8 +178,7 @@ class DataProcessor:
         Returns:
             Path to the dataset CSV if it exists, None otherwise.
         """
-        dataset_csv = self.data_dir / "hls_raster_dataset.csv"
-
-        if dataset_csv.exists():
-            return str(dataset_csv)
+        matches = list(self.data_dir.glob("*_dataset.csv"))
+        if matches:
+            return str(matches[0])
         return None

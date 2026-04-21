@@ -174,6 +174,7 @@ Comprehensive metrics for both regression and classification:
 Support for model distillation, custom loss functions, and configurable training
 pipelines with Hydra configuration management.
 
+<a name="model-registry-synchronization"></a>
 ## 🗃️ Model Registry Synchronization
 
 InstaGeo provides a model registry system that lets you easily download pre-trained models from Google Cloud Storage.
@@ -228,6 +229,39 @@ mkdir -p /path/to/models/folder
 cd instageo/model/registry && chmod +x model_registry_sync.sh
 ./model_registry_sync.sh "gs://path/to/registry/file.yaml" /path/to/models/folder
 ```
+
+### Registry File Structure
+
+The registry YAML file defines the models available for download. An example registry file following the expected structure is available at:
+
+```
+https://storage.googleapis.com/instageo/models-registry/models_registry.yaml
+```
+
+The file uses the following format:
+
+```yaml
+version: "1.0"
+last_updated: "YYYY-MM-DD"
+
+models:
+  <model-id>:
+    model_type: <seg|reg>              # seg = segmentation, reg = regression
+    model_short_name: "<short-name>"
+    model_name: "<Full Model Name>"
+    model_description: "<description>"
+    classes_mapping:                   # null for regression models
+      0: "<class-0-label>"
+      1: "<class-1-label>"
+    data_source: "<HLS|S2|S1>"
+    temporal_step: <int>
+    sizes:
+      <size-name>:                     # e.g. tiny, large, x-large
+        gcs_folder: "gs://<bucket>/<path>"
+        num_params: <float>            # number of parameters in millions
+```
+
+Each entry under `models` is keyed by a model ID. The `sizes` block lists available variants, each pointing to a GCS folder from which the sync script downloads the model artifacts.
 
 ### Available Models
 - **AOD Estimator**: Aerosol optical depth estimation from satellite imagery

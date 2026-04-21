@@ -210,6 +210,7 @@ class TaskCreationRequest(BaseModel):
     cloud_coverage: int
     mask_cloud: bool
     temporal_tolerance: int
+    stitching: bool = True  # Default True for app: bounding boxes produce contiguous regions
 
 
 class TaskCreationResponse(BaseModel):
@@ -290,6 +291,7 @@ async def create_task(
             "cloud_coverage": task_request.cloud_coverage,
             "mask_cloud": task_request.mask_cloud,
             "temporal_tolerance": task_request.temporal_tolerance or model_info.temporal_step,
+            "stitching": task_request.stitching,
             # True model parameters from registry
             "chip_size": model_info.chip_size,
             "num_steps": model_info.num_steps,

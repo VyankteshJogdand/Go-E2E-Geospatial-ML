@@ -314,6 +314,8 @@ HOST_MODELS_PATH=/path/to/models       # Local path for model storage
 MODELS_REGISTRY_GCS_URI="gs://path/to/models/registry.yaml"
 ```
 
+> For the expected registry file format and available models, see the [Model Component Documentation](./instageo/model/README.md#model-registry-synchronization).
+
 **Required for Cloudflare tunnel (use `--cloudflare` flag):**
 ```bash
 DOMAIN_NAME=your-domain.com
@@ -453,7 +455,7 @@ Advanced machine learning capabilities built on the Prithvi foundational model:
 
 - **Custom Training**: Fine-tune models for classification and regression tasks
 - **Multiple Inference Modes**: Chip inference, sliding window, and Ray-based serving
-- **Model Registry**: Centralized model management with GCS integration
+- **Model Registry**: Centralized model management with GCS integration (see [registry format and available models](./instageo/model/README.md#model-registry-synchronization))
 - **Comprehensive Metrics**: Advanced evaluation and monitoring capabilities
 
 **Key Features:**

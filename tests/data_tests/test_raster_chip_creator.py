@@ -1,226 +1,157 @@
+import json
 import os
+import pathlib
 import shutil
-from datetime import datetime
-from unittest.mock import MagicMock, patch
 
 import geopandas as gpd
-import pandas as pd
+import mgrs
+import numpy as np
 import pytest
+import xarray as xr
 from absl import flags
-from pystac import Asset, Item
-from shapely.geometry import Point
+from shapely.geometry import box
 
-from instageo.data.hls_utils import HLSRasterPipeline
 from instageo.data.raster_chip_creator import main
+from instageo.data.settings import DataPipelineSettings
 
 FLAGS = flags.FLAGS
 
+test_root = pathlib.Path(__file__).parent.resolve()
+test_data_root = test_root.parent / "data"
+
+_settings = DataPipelineSettings()
+DATA_SOURCE_SPATIAL_RES = {
+    "HLS": _settings.HLS_SPATIAL_RESOLUTION,
+    "S2": _settings.S2_SPATIAL_RESOLUTION,
+    "S1": _settings.S1_SPATIAL_RESOLUTION,
+}
+
+SEG_MAP_TIF = str(test_data_root / "label_1_18TWL.tif")
+SEG_MAP_BOUNDS = (-74.0, 40.76683465713849, -73.97700312872654, 40.78983152841195)
+
+
+def get_mgrs_tile(lon, lat):
+    m = mgrs.MGRS()
+    return m.toMGRS(lat, lon, MGRSPrecision=0)
+
 
 @pytest.fixture
-def setup_and_teardown_output_dir():
-    output_dir = "/tmp/test_raster_chip_creator"
-    os.makedirs(output_dir, exist_ok=True)
-    yield output_dir
-    shutil.rmtree(output_dir)
+def output_dir():
+    path = "/tmp/test_raster_chip_creator"
+    shutil.rmtree(path, ignore_errors=True)
+    os.makedirs(path, exist_ok=True)
+    yield path
+    shutil.rmtree(path, ignore_errors=True)
 
 
 @pytest.fixture
-def sample_records():
-    data = pd.DataFrame(
-        {
-            "date": ["2022-06-08", "2022-06-08"],
-            "x": [44.48, 44.48865],
-            "y": [15.115617, 15.099767],
-            "label_filename": ["mask_1.tif", "mask_2.tif"],
-            "stac_items_str": ["20220608_38PMB", "20220608_38PMB"],
-            "mgrs_tile_id": ["38PMB", "38PMB"],
-        }
-    )
-    data["date"] = pd.to_datetime(data["date"])
+def records_file(output_dir):
+    """Create a records gpkg from the existing segmentation tif bounds."""
+    left, bottom, right, top = SEG_MAP_BOUNDS
+    cx, cy = (left + right) / 2, (bottom + top) / 2
+
     gdf = gpd.GeoDataFrame(
-        data, geometry=[Point(xy) for xy in zip(data.x, data.y)], crs="EPSG:4326"
+        {
+            "date": ["2025-07-31"],
+            "mgrs_tile_id": [get_mgrs_tile(cx, cy)],
+            "label_filename": [os.path.basename(SEG_MAP_TIF)],
+        },
+        geometry=[box(left, bottom, right, top)],
+        crs="EPSG:4326",
     )
-    return gdf
+    path = os.path.join(output_dir, "records.gpkg")
+    gdf.to_file(path, driver="GPKG")
+    return path
 
 
 @pytest.fixture
-def mock_hls_dataset():
-    # Create a proper STAC Item
-    item = Item(
-        id="HLS.S30.T38PMB.2022145T072619.v2.0",
-        geometry=None,
-        bbox=None,
-        datetime=datetime(2022, 1, 1, 0, 0, 0),
-        properties={},
-    )
-
-    # Create proper Asset objects
-    b02_asset = Asset(href="test_b02.tif", media_type="image/tiff")
-    b03_asset = Asset(href="test_b03.tif", media_type="image/tiff")
-    fmask_asset = Asset(href="test_fmask.tif", media_type="image/tiff")
-
-    # Add assets to item
-    item.add_asset("B02", b02_asset)
-    item.add_asset("B03", b03_asset)
-    item.add_asset("Fmask", fmask_asset)
-
-    return {"20220608_38PMB": {"granules": [item.to_dict()]}}
+def bbox_json(output_dir):
+    """Create a bbox JSON file covering the same area."""
+    bbox_features = [list(SEG_MAP_BOUNDS)]
+    path = os.path.join(output_dir, "bbox_features.json")
+    with open(path, "w") as f:
+        json.dump(bbox_features, f)
+    return path
 
 
-def test_hls_raster_pipeline_init():
-    pipeline = HLSRasterPipeline(
-        output_directory="/tmp/test",
-        chip_size=256,
-        raster_path="/tmp/raster",
-        mask_types=["cloud"],
-        masking_strategy="each",
-        src_crs=4326,
-        spatial_resolution=30.0,
-        qa_check=True,
-    )
-    assert pipeline.output_directory == "/tmp/test"
-    assert pipeline.chip_size == 256
-    assert pipeline.raster_path == "/tmp/raster"
-    assert pipeline.mask_types == ["cloud"]
-    assert pipeline.masking_strategy == "each"
-    assert pipeline.src_crs == 4326
-    assert pipeline.spatial_resolution == 30.0
-    assert pipeline.qa_check is True
+def base_flags(output_dir, data_source="HLS"):
+    return [
+        "raster_chip_creator",
+        "--output_directory",
+        output_dir,
+        "--data_source",
+        data_source,
+        "--chip_size",
+        "256",
+        "--masking_strategy",
+        "any",
+        "--num_steps",
+        "1",
+        "--temporal_step",
+        "30",
+        "--temporal_tolerance",
+        "10",
+        "--cloud_coverage",
+        "50",
+        "--nodaytime_only",
+        "--qa_check",
+    ]
 
 
-@patch("instageo.data.raster_chip_creator.HLSRasterPipeline")
-@patch("instageo.data.raster_chip_creator.create_records_with_items")
-@patch("instageo.data.hls_utils.add_hls_stac_items")
-@patch("instageo.data.raster_chip_creator.Client.open")
-def test_main_hls_pipeline(
-    mock_client,
-    mock_add_items,
-    mock_create_records,
-    mock_pipeline,
-    setup_and_teardown_output_dir,
-    sample_records,
-    mock_hls_dataset,
-):
-    # Setup mocks
-    mock_client_instance = MagicMock()
-    mock_client.return_value = mock_client_instance
-    mock_add_items.return_value = sample_records
-    mock_create_records.return_value = (sample_records, mock_hls_dataset)
-    mock_pipeline_instance = MagicMock()
-    mock_pipeline.return_value = mock_pipeline_instance
-
-    # Create test files
-    os.makedirs(os.path.join(setup_and_teardown_output_dir, "chips"), exist_ok=True)
-    os.makedirs(os.path.join(setup_and_teardown_output_dir, "seg_maps"), exist_ok=True)
-
-    # Save sample records
-    records_file = os.path.join(setup_and_teardown_output_dir, "test_records.gpkg")
-    sample_records.to_file(records_file, driver="GPKG")
-
-    # Parse flags
-    flags.FLAGS.unparse_flags()
-    flags.FLAGS(
-        [
-            "raster_chip_creator",
+@pytest.mark.auth
+@pytest.mark.parametrize("data_source", ["HLS", "S2", "S1"])
+def test_raster_chip_creator_standard(output_dir, records_file, data_source):
+    FLAGS.unparse_flags()
+    FLAGS(
+        base_flags(output_dir, data_source)
+        + [
             "--records_file",
             records_file,
             "--raster_path",
-            "/tmp/raster",
-            "--output_directory",
-            setup_and_teardown_output_dir,
-            "--data_source",
-            "HLS",
+            str(test_data_root),
         ]
     )
-
-    # Run main function
     main(None)
 
-    # Verify pipeline was called
-    mock_pipeline.assert_called_once()
+    chips = os.listdir(os.path.join(output_dir, "chips"))
+    seg_maps = os.listdir(os.path.join(output_dir, "seg_maps"))
+    assert len(chips) > 0
+    assert len(chips) == len(seg_maps)
+
+    chip = xr.open_dataset(os.path.join(output_dir, "chips", chips[0]))
+    seg_map = xr.open_dataset(os.path.join(output_dir, "seg_maps", seg_maps[0]))
+    assert chip.band_data.shape[-2:] == (256, 256)
+    assert np.unique(chip.band_data).size > 1
+    assert seg_map.band_data.shape[-2:] == (256, 256)
 
 
-@patch("instageo.data.raster_chip_creator.Client.open")
-@patch("instageo.data.hls_utils.add_hls_stac_items")
-@patch("instageo.data.raster_chip_creator.create_records_with_items")
-@patch("instageo.data.raster_chip_creator.HLSRasterPipeline")
-def test_main_hls_pipeline_existing_dataset(
-    mock_pipeline,
-    mock_create_records,
-    mock_add_items,
-    mock_client,
-    setup_and_teardown_output_dir,
-    sample_records,
-    mock_hls_dataset,
-):
-    # Setup mocks
-    mock_client_instance = MagicMock()
-    mock_client.return_value = mock_client_instance
-    mock_add_items.return_value = sample_records
-    mock_create_records.return_value = (sample_records, mock_hls_dataset)
-    mock_pipeline_instance = MagicMock()
-    mock_pipeline.return_value = mock_pipeline_instance
-
-    # Create existing dataset files
-    with open(os.path.join(setup_and_teardown_output_dir, "hls_dataset.json"), "w") as f:
-        import json
-
-        json.dump(mock_hls_dataset, f)
-
-    sample_records.to_file(
-        os.path.join(setup_and_teardown_output_dir, "filtered_obsv_records.gpkg"),
-        driver="GPKG",
-    )
-
-    # Save sample records
-    records_file = os.path.join(setup_and_teardown_output_dir, "test_records.gpkg")
-    sample_records.to_file(records_file, driver="GPKG")
-
-    # Parse flags
-    flags.FLAGS.unparse_flags()
-    flags.FLAGS(
-        [
-            "raster_chip_creator",
-            "--records_file",
-            records_file,
-            "--raster_path",
-            "/tmp/raster",
-            "--output_directory",
-            setup_and_teardown_output_dir,
-            "--data_source",
-            "HLS",
+@pytest.mark.auth
+@pytest.mark.parametrize("data_source", ["HLS", "S2", "S1"])
+def test_raster_chip_creator_bbox(output_dir, bbox_json, data_source):
+    FLAGS.unparse_flags()
+    FLAGS(
+        base_flags(output_dir, data_source)
+        + [
+            "--is_bbox_feature",
+            "--bbox_feature_path",
+            bbox_json,
+            "--date",
+            "15-06-2023",
+            "--spatial_resolution",
+            str(DATA_SOURCE_SPATIAL_RES[data_source]),
         ]
     )
-
-    # Run main function
     main(None)
 
-    # Verify existing dataset was used
-    mock_add_items.assert_not_called()
-    mock_create_records.assert_not_called()
+    chips = os.listdir(os.path.join(output_dir, "chips"))
+    assert len(chips) > 0
 
+    chip = xr.open_dataset(os.path.join(output_dir, "chips", chips[0]))
+    assert chip.band_data.shape[-2:] == (256, 256)
+    assert np.unique(chip.band_data).size > 1
 
-def test_main_unsupported_data_source(setup_and_teardown_output_dir, sample_records):
-    # Save sample records
-    records_file = os.path.join(setup_and_teardown_output_dir, "test_records.gpkg")
-    sample_records.to_file(records_file, driver="GPKG")
-
-    # Parse flags
-    flags.FLAGS.unparse_flags()
-    flags.FLAGS(
-        [
-            "raster_chip_creator",
-            "--records_file",
-            records_file,
-            "--raster_path",
-            "/tmp/raster",
-            "--output_directory",
-            setup_and_teardown_output_dir,
-            "--data_source",
-            "S1",
-        ]
+    # No seg_maps for bbox feature mode
+    assert (
+        not os.path.exists(os.path.join(output_dir, "seg_maps"))
+        or len(os.listdir(os.path.join(output_dir, "seg_maps"))) == 0
     )
-
-    # Test with unsupported data source
-    with pytest.raises(NotImplementedError):
-        main(None)

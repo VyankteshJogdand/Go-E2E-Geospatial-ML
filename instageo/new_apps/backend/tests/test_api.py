@@ -73,6 +73,7 @@ def test_run_model_and_task_status():
             "cloud_coverage": 10,
             "mask_cloud": False,
             "temporal_tolerance": 30,
+            "stitching": True,
         }
         response = client.post("/api/run-model", json=payload)
         assert response.status_code == 200
@@ -147,6 +148,7 @@ def test_get_all_tasks():
             "cloud_coverage": 10,
             "mask_cloud": False,
             "temporal_tolerance": 30,
+            "stitching": False,
         }
         response = client.post("/api/run-model", json=payload)
         assert response.status_code == 200

@@ -159,11 +159,20 @@ def find_closest_items(
     candidate_items_field: str,
     temporal_tolerance: int = 3,
     temporal_tolerance_minutes: int = 0,
+    use_cloud_cover: bool = True,
 ) -> List[Item | None]:
-    """Finds closest PySTAC items in time with least cloud coverage.
+    """Finds closest PySTAC items in time.
 
-    Retrieves all PySTAC items within `temporal_tolerance` time window for a given observation and
-    select the one with least cloud_coverage.
+    Retrieves all PySTAC items within `temporal_tolerance` time window for a given observation
+    and selects the best one based on the selection criteria.
+
+    Selection behavior:
+    - When use_cloud_cover=True (optical sensors like HLS, S2): Among all items within the
+      temporal tolerance window, select the one with the least cloud coverage. This is
+      appropriate for optical data where cloud coverage affects data quality.
+    - When use_cloud_cover=False (SAR sensors like S1): Among all items within the temporal
+      tolerance window, select the one that is temporally closest to the query date. This is
+      appropriate for SAR data where cloud coverage is not applicable.
 
     Args:
         obsv (pandas.Series): Observation data containing the observation date
@@ -171,6 +180,10 @@ def find_closest_items(
         candidate_items_field (str): Field name containing candidate items.
         temporal_tolerance (int): Number of days that can be tolerated for matching
             granules from the candidate items.
+        temporal_tolerance_minutes (int): Number of minutes to add to the temporal
+            tolerance.
+        use_cloud_cover (bool): If True, select by minimum cloud coverage (optical sensors).
+            If False, select by temporal proximity (SAR sensors). Defaults to True.
 
     Returns:
         List[Item | None]: A list containing items if found within the temporal
@@ -192,24 +205,30 @@ def find_closest_items(
         if not candidates:
             closest_items.append(None)
         else:
-            selected = min(
-                candidates,
-                key=lambda item: item.properties.get(
-                    "eo:cloud_cover", 100
-                ),  # maximum cloud coverage is 100%
-            )
+            if use_cloud_cover:
+                # For optical data: select by minimum cloud coverage
+                selected = min(
+                    candidates,
+                    key=lambda item: item.properties.get("eo:cloud_cover", 100),
+                )
+            else:
+                # For SAR data: select by temporal proximity
+                selected = min(
+                    candidates,
+                    key=lambda item: abs((item.datetime - query_date).total_seconds()),
+                )
             closest_items.append(selected)
     return closest_items
 
 
-def get_raster_tile_info(
+def get_tile_info(
     data: gpd.GeoDataFrame,
     num_steps: int = 3,
     temporal_step: int = 10,
     temporal_tolerance: int = 5,
     temporal_tolerance_minutes: int = 0,
 ) -> Tuple[pd.DataFrame, List[Tuple[str, List[str]]]]:
-    """Get Raster Tile Info.
+    """Get Tile Info.
 
     Retrieves a summary of all tiles required for a given dataset. The summary contains
     the desired start and end date for each tile. Also retrieves a list of queries
@@ -397,6 +416,7 @@ def find_best_items(
     items_field: str,
     temporal_tolerance: int = 12,
     temporal_tolerance_minutes: int = 0,
+    use_cloud_cover: bool = True,
 ) -> dict[str, pd.DataFrame]:
     """Finds best PySTAC items for all observations when possible.
 
@@ -416,6 +436,8 @@ def find_best_items(
         temporal_tolerance (int): Tolerance (in days) for finding closest items.
         temporal_tolerance_minutes (int): Additional tolerance in minutes for finding
             closest items.
+        use_cloud_cover (bool): If True, select items by minimum cloud coverage (optical sensors).
+            If False, select items by temporal proximity (SAR sensors). Defaults to True.
 
     Returns:
         A dictionary mapping each MGRS tile ID to a DataFrame containing the observations
@@ -442,10 +464,78 @@ def find_best_items(
                 candidate_items_field=candidate_items_field,
                 temporal_tolerance=temporal_tolerance,
                 temporal_tolerance_minutes=temporal_tolerance_minutes,
+                use_cloud_cover=use_cloud_cover,
             ),
             axis=1,
         )
         best_items[tile_id] = tile_obsvs_with_items.drop(columns=[candidate_items_field])
+    return best_items
+
+
+def add_stac_items(
+    client: Client,
+    data: pd.DataFrame,
+    config: Any,
+    num_steps: int = 3,
+    temporal_step: int = 10,
+    temporal_tolerance: int = 12,
+    temporal_tolerance_minutes: int = 0,
+    cloud_coverage: int | None = 10,
+    daytime_only: bool = False,
+) -> dict[str, pd.DataFrame]:
+    """Generic function to search and add STAC items for any data source.
+
+    Data contains tile_id and a series of dates for which tiles are desired. This
+    function finds the satellite granules closest to the desired dates with a
+    tolerance of `temporal_tolerance`.
+
+    Args:
+        client: pystac_client Client to use for the search
+        data: DataFrame containing observations that fall within tiles
+        config: DataSourceConfig containing data-source-specific settings
+        num_steps: Number of temporal steps into the past to fetch
+        temporal_step: Step size (in days) for creating temporal steps
+        temporal_tolerance: Tolerance (in days) for finding closest items
+        temporal_tolerance_minutes: Additional tolerance in minutes for finding closest items
+        cloud_coverage: Maximum percentage of cloud coverage (None for SAR data)
+        daytime_only: Flag to filter out nighttime granules
+
+    Returns:
+        Dictionary mapping each MGRS tile ID to a DataFrame with associated STAC items
+    """
+    if "input_features_date" not in data.columns:
+        data = data.rename(columns={"date": "input_features_date"})
+
+    tiles_info, tile_queries = get_tile_info(
+        data,
+        num_steps=num_steps,
+        temporal_step=temporal_step,
+        temporal_tolerance=temporal_tolerance,
+        temporal_tolerance_minutes=temporal_tolerance_minutes,
+    )
+
+    data["tile_queries"] = tile_queries
+    tiles_database = retrieve_stac_metadata(
+        client,
+        tiles_info,
+        collections=config.collections,
+        bands_nameplate=config.bands_nameplate,
+        cloud_coverage=cloud_coverage,
+        daytime_only=daytime_only,
+    )
+
+    # Build field names using data source prefix
+    prefix = config.field_prefix
+    best_items = find_best_items(
+        data,
+        tiles_database,
+        item_id_field=f"{prefix}_item_id",
+        candidate_items_field=f"{prefix}_candidate_items",
+        items_field=f"{prefix}_items",
+        temporal_tolerance=temporal_tolerance,
+        temporal_tolerance_minutes=temporal_tolerance_minutes,
+        use_cloud_cover=config.supports_cloud_filtering,
+    )
     return best_items
 
 
@@ -479,7 +569,7 @@ def open_stac_items(
         CRS used.
     """
     # Load the bands for all timesteps and stack them in a data array
-    assets_to_load = bands_asset + [mask_band] if load_masks else bands_asset
+    assets_to_load = bands_asset + [mask_band] if (load_masks and mask_band) else bands_asset
     if sign_func is not None:
         plain_items = sign_func(ItemCollection(tile_dict))
     else:
@@ -496,7 +586,7 @@ def open_stac_items(
     )
 
     bands = adjust_dims(stacked_items.sel(band=bands_asset))
-    masks = adjust_dims(stacked_items.sel(band=[mask_band])) if load_masks else None
+    masks = adjust_dims(stacked_items.sel(band=[mask_band])) if (load_masks and mask_band) else None
 
     # Convert to float32 if we are dealing with Sentinel-1
     bands = bands.astype("float32") if bands_asset == S1_BANDS.ASSET else bands.astype("uint16")

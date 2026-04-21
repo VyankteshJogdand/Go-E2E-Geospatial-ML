@@ -24,6 +24,7 @@ import os
 from typing import Dict, List
 
 import earthaccess
+from pydantic import Field
 from pydantic_settings import BaseSettings
 
 logging.basicConfig(level=logging.INFO)
@@ -31,11 +32,6 @@ logging.basicConfig(level=logging.INFO)
 
 def get_access_token() -> str:
     """Configures EarthData credentials based on AIChor environment variables."""
-    # Check if we're in test mode
-    if os.getenv("TESTING", "false").lower() == "true":
-        logging.info("Running in test mode, skipping EarthData authentication")
-        return ""
-
     author_email = os.getenv("VCS_AUTHOR_EMAIL")
     if author_email:
         author_username, _ = author_email.split("@")
@@ -67,7 +63,7 @@ class GDALOptions(BaseSettings):
 
     CPL_VSIL_CURL_ALLOWED_EXTENSIONS: str = ".tif"
     GDAL_HTTP_AUTH: str = "BEARER"
-    GDAL_HTTP_BEARER: str = get_access_token()
+    GDAL_HTTP_BEARER: str = Field(default_factory=get_access_token)
     GDAL_DISABLE_READDIR_ON_OPEN: str = "EMPTY_DIR"
     GDAL_HTTP_MAX_RETRY: str = "10"
     GDAL_HTTP_RETRY_DELAY: str = "0.5"
@@ -230,3 +226,4 @@ class DataPipelineSettings(BaseSettings):
     COG_DOWNLOAD_RATELIMIT: int = 30  # Number of COG downloads per minute
     HLS_SPATIAL_RESOLUTION: float = 0.0002694945852358564
     S2_SPATIAL_RESOLUTION: float = 8.983152841195215e-05
+    S1_SPATIAL_RESOLUTION: float = 8.983152841195215e-05

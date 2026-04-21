@@ -1,0 +1,1032 @@
+# ------------------------------------------------------------------------------
+# This code is licensed under the Attribution-NonCommercial-ShareAlike 4.0
+# International (CC BY-NC-SA 4.0) License.
+#
+# You are free to:
+# - Share: Copy and redistribute the material in any medium or format
+# - Adapt: Remix, transform, and build upon the material
+#
+# Under the following terms:
+# - Attribution: You must give appropriate credit, provide a link to the license,
+#   and indicate if changes were made. You may do so in any reasonable manner,
+#   but not in any way that suggests the licensor endorses you or your use.
+# - NonCommercial: You may not use the material for commercial purposes.
+# - ShareAlike: If you remix, transform, or build upon the material, you must
+#   distribute your contributions under the same license as the original.
+#
+# For more details, see https://creativecommons.org/licenses/by-nc-sa/4.0/
+# ------------------------------------------------------------------------------
+
+"""Seamless-seg module for InstaGeo backend.
+
+This module is a copy of the seamless-seg module from https://github.com/Multihuntr/seamless-seg.
+It is used to apply seamless segmentation post-processing to smooth tile boundaries in predictions.
+"""
+
+import collections
+import dataclasses
+import math
+import queue
+import threading
+from pathlib import Path
+from typing import Generator, Iterable, Sequence
+
+import numpy as np
+import scipy
+import shapely
+import shapely.affinity
+
+# Consistently arbitrarily ordered list of 8 directions to look for adjacent tiles
+GRID_DIR = np.array([(j, i) for j in (-1, 0, 1) for i in (-1, 0, 1) if not (i == j == 0)])
+
+
+def shape_to_slices(shp: shapely.Geometry):
+    ylo, xlo, yhi, xhi = shp.bounds
+    ylo, xlo = round(ylo), round(xlo)
+    yhi, xhi = round(yhi), round(xhi)
+    return slice(ylo, yhi), slice(xlo, xhi)
+
+
+def mk_circle_of_trust(h, w):
+    trust_coords_T = np.array([(-1, h // 2, h), (-1, w // 2, w)])
+    trust_values = [[0, 0, 0], [0, 1, 0], [0, 0, 0]]
+    interpolator = scipy.interpolate.RegularGridInterpolator(trust_coords_T, trust_values)
+
+    eval_coords = tuple(np.indices((h, w)))
+    return interpolator(eval_coords)
+
+
+def get_trimmed_bounds(margin: tuple[int, int], dirs: Sequence[tuple[int, int]]):
+    if margin is None:
+        return 0, 0, None, None
+    my, mx = margin
+    ylo, xlo, yhi, xhi = 0, 0, None, None
+    for j, i in dirs:
+        if j == -1:
+            ylo = my
+        if j == 1:
+            yhi = -my
+        if i == -1:
+            xlo = mx
+        if i == 1:
+            xhi = -mx
+    return ylo, xlo, yhi, xhi
+
+
+def trim_array(arr: np.ndarray, bounds: tuple[int, int, int, int]):
+    ylo, xlo, yhi, xhi = bounds
+    return arr[..., ylo:yhi, xlo:xhi]
+
+
+def trim_box(shp: shapely.Geometry, bounds: tuple[int, int, int, int]):
+    bylo, bxlo, byhi, bxhi = shp.bounds
+    tylo, txlo, tyhi, txhi = bounds
+    slices = (slice(tylo, tyhi), slice(txlo, txhi))
+    tyhi = 0 if tyhi is None else tyhi
+    txhi = 0 if txhi is None else txhi
+    new_box = shapely.box(bylo + tylo, bxlo + txlo, byhi + tyhi, bxhi + txhi)
+    return new_box, slices
+
+
+def overlap_weights(
+    central: shapely.Geometry,
+    nearby: Sequence[shapely.Geometry],
+    trim_bounds: tuple[int, int, int, int] = None,
+) -> (
+    shapely.Geometry,
+    np.ndarray,
+    tuple[slice, slice],
+    np.ndarray,
+    list[tuple[tuple[slice, slice], tuple[slice, slice]]],
+):
+    """
+    Calculates everything needed to combine a central geometry with N nearby geometries.
+    The nearby geometries need not be in a regular grid. They can be arbitrarily arranged.
+    Invoking this does not depend on any real data.
+    When trim_bounds is provided, it forces the output to be sliced to fit those bounds.
+
+    For simple use cases, use in conjunction with seamless_seg.apply_weights.
+
+    By default, overlap_weights describes the full area of the central geometry.
+    Thus, using it once each on adjacent tiles describes the overlapping area between
+    them twice (i.e. in each call).
+    To account for this, provide a trim_bounds of half the overlapping area.
+
+    e.g. Say we have two tiles 100 pixels wide next to each other, and they overlap
+    40 pixels with each other.
+    ```
+    geom_a = shapely.box(0, 0, 100, 100)
+    geom_b = shapely.box(0, 60, 100, 160)
+
+    out_geom_a, _, _, _, _ = overlap_weights(geom_a, [geom_b])
+    out_geom_b, _, _, _, _ = overlap_weights(geom_b, [geom_a])
+
+    print(shapely.area(shapely.intersection(out_geom_a, out_geom_b)))
+    # is 40*100 = 4000
+
+    out_geom_a, _, _, _, _ = overlap_weights(geom_a, [geom_b], (0, 0, None, -20))
+    out_geom_b, _, _, _, _ = overlap_weights(geom_b, [geom_a], (0, 20, None, None))
+
+    print(shapely.area(shapely.intersection(out_geom_a, out_geom_b)))
+    # is 0 because the overlapping region has been trimmed a bit on each side
+    ```
+
+    Returns:
+        out_geom: defines the space in the output to which the central_weights refers
+        central_weights: how much to use the data from central per-pixel (0 to 1)
+        centre_from_tile_slc: slices into tile defined by central to select out_geom
+        nearby_weights: how much to use each of the nearby geometries
+        slice_pairs: how to read from central_weights and nearby_weights for combining
+    """
+    # Make circle of trust for the central geom
+    ylo, xlo, yhi, xhi = central.bounds
+    h, w = int(yhi - ylo), int(xhi - xlo)
+    circle_of_trust = mk_circle_of_trust(h, w)
+
+    # Make circles of trust for nearby geoms
+    nearby_bounds = [n.bounds for n in nearby]
+    nearby_shp = [(int(b[2] - b[0]), int(b[3] - b[1])) for b in nearby_bounds]
+    nearby_circles_of_trust = np.stack([mk_circle_of_trust(nh, nw) for nh, nw in nearby_shp])
+
+    # Initialise trusts to be read from nearby geoms
+    nearby_trusts = np.zeros((len(nearby), h, w))
+
+    # If we need to trim the bounds, we trim only the central geom and associated arrays
+    if trim_bounds is not None:
+        tylo, txlo, _, _ = trim_bounds
+        ylo += tylo
+        xlo += txlo
+        circle_of_trust = trim_array(circle_of_trust, trim_bounds)
+        nearby_trusts = trim_array(nearby_trusts, trim_bounds)
+        central, centre_from_tile_slc = trim_box(central, trim_bounds)
+    else:
+        centre_from_tile_slc = (slice(None, None), slice(None, None))
+
+    # Calculate nearby trusts and how to slice these trusts for each nearby geom
+    overlaps = shapely.intersection(np.array([central]), np.array(nearby))
+    slice_pairs = []
+    for i, overlap in enumerate(overlaps):
+        # Get slices into central and nearby
+        oylo, oxlo, _, _ = nearby[i].bounds
+        central_slices = shape_to_slices(shapely.affinity.translate(overlap, -ylo, -xlo))
+        nearby_slices = shape_to_slices(shapely.affinity.translate(overlap, -oylo, -oxlo))
+        slice_pairs.append((central_slices, nearby_slices))
+
+        # Write just for the overlapping parts
+        i_c_slices = (i, *central_slices)
+        i_n_slices = (i, *nearby_slices)
+        nearby_trusts[i_c_slices] = nearby_circles_of_trust[i_n_slices]
+
+    # Normalise pixel-wise
+    total = np.concatenate([circle_of_trust[None], nearby_trusts], axis=0).sum(axis=0)
+    central_weights = circle_of_trust / total
+    nearby_weights = nearby_trusts / total
+
+    return central, central_weights, centre_from_tile_slc, nearby_weights, slice_pairs
+
+
+def apply_weights(central_tile: np.ndarray, nearby_tiles: list[np.ndarray], weights):
+    """
+    Apply overlap weights to real tile data.
+
+    Example usage:
+    ```
+    # Assuming we have: central_geom, nearby_geoms, central_tile, nearby_tiles
+    weights = seamless_seg.overlap_weights(central_geom, nearby_geoms)
+    out_geom, out_tile = seamless_seg.apply_weights(central_tile, nearby_tiles, weights)
+    ```
+    """
+    out_geom, central_weights, centre_from_tile_slc, nearby_weights, slice_pairs = weights
+    out_tile = central_tile[centre_from_tile_slc] * central_weights[..., None]
+    z = enumerate(zip(nearby_weights, slice_pairs))
+    for i, (nearby_weight, (central_slices, nearby_slices)) in z:
+        vals = nearby_tiles[i][nearby_slices]
+        val_weights = nearby_weight[central_slices][..., None]
+        out_tile[central_slices] += vals * val_weights
+    return out_geom, out_tile
+
+
+def mk_box_grid(
+    width, height, x_offset=0, y_offset=0, box_width=1, box_height=1, overlap_x=0, overlap_y=0
+):
+    """
+    Create a grid of box geometries, stored in a vectorised Shapely array.
+    """
+    gap_width = box_width - overlap_x
+    gap_height = box_height - overlap_y
+    xs = np.arange((width - overlap_x) // gap_width) * gap_width
+    ys = np.arange((height - overlap_y) // gap_height) * gap_height
+    yss, xss = np.meshgrid(ys, xs)
+    # fmt: off
+    coords = np.array([ # Clockwise squares
+        [xss+x_offset,           yss+y_offset],
+        [xss+x_offset+box_width, yss+y_offset],
+        [xss+x_offset+box_width, yss+y_offset+box_height],
+        [xss+x_offset,           yss+y_offset+box_height],
+    ]).transpose((2,3,0,1)) # shapes [4, 2, W, H] -> [W, H, 4, 2]
+    # fmt: on
+    return shapely.polygons(coords)
+
+
+def calc_gridcell_needed(grid_mask):
+    # Calculate which grid cells are needed to calculate grid cells that are in grid_mask
+    any_masks = [grid_mask]
+
+    # For each direction, grab an offset grid_mask, indicating which cells are needed due
+    # to there being a needed grid cell in that direction
+    def _dir_to_slice(v):
+        if v == -1:
+            return slice(None, -1), slice(1, None)
+        elif v == 1:
+            return slice(1, None), slice(None, -1)
+        else:
+            return slice(None), slice(None)
+
+    for j, i in GRID_DIR:
+        orig_y_slc, out_y_slc = _dir_to_slice(j)
+        orig_x_slc, out_x_slc = _dir_to_slice(i)
+        mask = np.zeros_like(grid_mask, dtype=bool)
+        mask[out_y_slc, out_x_slc] = grid_mask[orig_y_slc, orig_x_slc]
+        any_masks.append(mask)
+    return np.any(any_masks, axis=0)
+
+
+def row_by_row_traversal(grid, add_load, add_unload, add_write):
+    """
+    Traverses a grid, deciding when to load/unload/write tiles.
+    The responsibility of this function is to ensure that for every write action marked,
+    at that point in the plan, all nearby tiles would be loaded into the cache.
+    It is not the responsibility of this function to determine if any such tile is in bounds.
+
+    This traverses row-by-row, keeping two full rows of tiles in the cache at once.
+    This will ensure that no tile is read more than once and has a significantly smaller
+    memory requirement than keeping all tiles in memory at once.
+    This may not be optimal in all cases.
+    """
+    gh, gw = grid.shape[:2]
+    if gh >= gw:
+        for gx in range(gw):
+            add_load(0, gx)
+        for gy in range(gh):
+            # Visualising what is in cache:
+            #  ("|" means the tile is loaded, "." means the tile is not)
+            # The cache should look like this for the row
+            # gy-1:  ||||||||
+            # gy:    ||||||||
+            # gy+1:  ........
+            add_load(gy + 1, 0)
+            # gy-1:  ||||||||
+            # gy:    ||||||||
+            # gy+1:  |.......
+            for gx in range(gw):
+                # |||
+                # |||
+                # ||.
+                add_load(gy + 1, gx + 1)
+                add_write(gy, gx)
+                add_unload(gy - 1, gx - 1)
+                # .||
+                # |||
+                # |||
+            # gy-1: .......|
+            # gy:   ||||||||
+            # gy+1: ||||||||
+            add_unload(gy - 1, gw - 1)
+            # gy-1: ........
+            # gy:   ||||||||
+            # gy+1: ||||||||
+        for gx in range(gw):
+            add_unload(gh - 1, gx)
+    else:
+        # As above, but transposed
+        for gy in range(gh):
+            add_load(gy, 0)
+        for gx in range(gw):
+            add_load(0, gx + 1)
+            for gy in range(gh):
+                add_load(gy + 1, gx + 1)
+                add_write(gy, gx)
+                add_unload(gy - 1, gx - 1)
+            add_unload(gh - 1, gx - 1)
+        for gy in range(gh):
+            add_unload(gy, gw - 1)
+
+
+def _mk_angle_to_dir_fnc(bounds: tuple[int, int, int, int]):
+    ylo, xlo, yhi, xhi = bounds
+    ydif, xdif = (yhi - ylo), (xhi - xlo)
+    diag_angle = math.atan(ydif / xdif)
+    angle_to_dir = {
+        math.pi * 0 / 4: (0, 1),
+        math.pi * 0 / 4 + diag_angle: (1, 1),
+        math.pi * 2 / 4: (1, 0),
+        math.pi * 4 / 4 - diag_angle: (1, -1),
+        math.pi * 4 / 4: (0, -1),
+        -math.pi * 4 / 4 + diag_angle: (-1, -1),
+        -math.pi * 2 / 4: (-1, 0),
+        -math.pi * 0 / 4 - diag_angle: (-1, 1),
+    }
+    key_angles = np.array(list(angle_to_dir.keys()))
+
+    def _calc_dir(ydif, xdif):
+        angle = math.atan2(ydif, xdif)
+        adif = np.abs(key_angles - angle) % (2 * math.pi)
+        min_angle = adif.argmin()
+        return angle_to_dir[key_angles[min_angle]]
+
+    return _calc_dir
+
+
+def coerce_to_grid(boundss: np.ndarray) -> tuple[np.ndarray, list[tuple[int, int]]]:
+    """
+    Algorithm to coerce a flat list of geometry bounds into a 2D geometry grid.
+    Not well-optimised.
+
+    Assumptions:
+      * scanning by overlapping bounds will discover all boundss
+      * boundss are all the same size
+
+    Returns:
+        grid: np.ndarray
+            2D grid of shapely geometries shaped [H, W]
+        mapping: list[tuple[int, int]]
+            parallel to input flat list, where each geometry ended up in grid
+    """
+    # Ensure order is top-left to bottom-right
+    boundss = sorted(boundss.tolist())
+    boundss = np.asarray(boundss)
+
+    # Get all overlaps
+    geoms = np.asarray([shapely.box(*b) for b in boundss])  # shaped [N, 4, 2]
+    overlaps = shapely.intersects(geoms[:, None], geoms[None])
+
+    # Define how to identify directions
+    _calc_dir = _mk_angle_to_dir_fnc(boundss[0])
+
+    # Start from the first box in boundss. Breadth-first search through the boxes.
+    # Use overlap to identify adjacent boxes.
+    # Assign a y/x coord to each discovered box.
+    # Add each found box and y/x coord to grid_list.
+    open_list = [(0, 0, 0)]
+    closed_list = [0]
+    grid_list = []
+    mapped = {0: (0, 0)}
+    closed_set = {(0, 0)}
+    while len(open_list) > 0:
+        i, y, x = open_list.pop(0)
+        grid_list.append((i, y, x))
+        iylo, ixlo, iyhi, ixhi = boundss[i]
+        icy, icx = (iylo + iyhi) / 2, (ixlo + ixhi) / 2
+        dists = collections.defaultdict(list)
+        for j in overlaps[i].nonzero()[0]:
+            if i == j:
+                continue
+            if j not in closed_list:
+                jylo, jxlo, jyhi, jxhi = boundss[j]
+                jcy, jcx = (jylo + jyhi) / 2, (jxlo + jxhi) / 2
+                dy, dx = jcy - icy, jcx - icx
+                ymod, xmod = _calc_dir(dy, dx)
+                if (y + ymod, x + xmod) not in closed_set:
+                    dists[(ymod, xmod)].append((j.item(), np.linalg.norm((dy, dx)).item()))
+        for (ymod, xmod), distlist in dists.items():
+            d_np = np.array(distlist)
+            j = round(d_np[np.argmin(d_np[:, 1])][0].item())
+            open_list.append((j, y + ymod, x + xmod))
+            mapped[j] = [y + ymod, x + xmod]
+            closed_list.append(j)
+            closed_set.add((y + ymod, x + xmod))
+
+    # Create a 2D grid of coordinates, and populate with boxes found in search
+    grid_list = np.array(grid_list)
+    ymin = grid_list[:, 1].min()
+    xmin = grid_list[:, 2].min()
+    ymax = grid_list[:, 1].max()
+    xmax = grid_list[:, 2].max()
+    grid = shapely.empty((ymax - ymin + 1, xmax - xmin + 1))
+
+    for i, y, x in grid_list:
+        grid[y - ymin, x - xmin] = shapely.box(*boundss[i])
+
+    mapping = [
+        (round(mapped[j][0] + ymin), round(mapped[j][1] + xmin)) for j in range(len(boundss))
+    ]
+
+    return grid, mapping
+
+
+def regular_grid(
+    image_size: tuple[int, int],
+    tile_size: tuple[int, int],
+    overlap: tuple[int, int],
+    area: shapely.Geometry = None,
+) -> np.ndarray[shapely.Geometry]:
+    # Unpack sizes
+    ih, iw = image_size
+    th, tw = tile_size
+    if area is None:
+        area = shapely.box(0, 0, ih, iw)
+
+    ylo, xlo, yhi, xhi = area.bounds
+
+    # If the area is smaller than the image, then we want to include tiles
+    # just outside the area so we can blend into the area properly
+    gpylo = max(0, ylo - th)
+    gpxlo = max(0, xlo - tw)
+    gpyhi = min(ih, yhi + th)
+    gpxhi = min(iw, xhi + tw)
+
+    # Make an initial regular grid
+    gph, gpw = gpyhi - gpylo, gpxhi - gpxlo
+    grid = mk_box_grid(gph, gpw, gpylo, gpxlo, th, tw, *overlap)
+    # If the grid doesn't cover the area perfectly (very likely),
+    # add another layer of boxes along the edges
+    gbyhi, gbxhi = grid[-1, -1].bounds[-2:]
+    if gbyhi < yhi:
+        # Create a new strip of boxes by copying the last one and then offsetting it such
+        # that it is flush with the area boundary.
+        gap = int(yhi - gbyhi)
+        grid_strip = np.array([shapely.affinity.translate(cell, gap, 0) for cell in grid[-1, :]])
+        grid = np.concatenate([grid, grid_strip[None]], axis=0)
+    if gbxhi < xhi:
+        gap = int(xhi - gbxhi)
+        grid_strip = np.array([shapely.affinity.translate(cell, 0, gap) for cell in grid[:, -1]])
+        grid = np.concatenate([grid, grid_strip[:, None]], axis=1)
+
+    # Remove grid cells outside area
+    mask = shapely.intersects(grid, area)
+    grid[~mask] = None
+
+    return grid
+
+
+def _mk_cache_hash(geom, dir_mask, nearby):
+    # Assuming tiles are always the same size, then
+    gylo, gxlo, _, _ = geom.bounds
+    ylos = np.asarray([gylo] + [shp.bounds[0] for shp in nearby])
+    xlos = np.asarray([gxlo] + [shp.bounds[1] for shp in nearby])
+    return dir_mask.sum().item(), ylos.mean() - gylo, xlos.mean() - gxlo
+
+
+@dataclasses.dataclass
+class Step:
+    action: str
+    index: tuple[int, int]  # grid index (can be used as cache key)
+
+
+@dataclasses.dataclass
+class LoadStep(Step):
+    geom: shapely.Geometry  # geometry to load
+
+
+@dataclasses.dataclass
+class WriteStep(Step):
+    geom: shapely.Geometry  # reference central geometry
+    nearby: Sequence[tuple[int, int]]  # indexes of geoms defined as nearby
+    weight: tuple  # outputs of overlap_weights
+
+
+def plan_from_grid(
+    grid: np.ndarray[shapely.Geometry],
+    margin: tuple[int, int] = None,
+    area: shapely.Geometry = None,
+    traversal_fnc: callable = row_by_row_traversal,
+) -> list[Step]:
+    """
+    Create a plan for running on a somewhat arbitrary grid.
+
+    There is a restriction/assumption that must be satisfied:
+    For each geometry at grid[y, x] the only geoms which overlap a tile are within +-1
+    e.g. for grid[5, 5], the only geoms which overlap it are in the range grid[4:7, 4:7]
+
+    Works for "grids" that aren't perfectly regular:
+        * can have small offsets (assuming offsets are smaller than (overlap - margin))
+
+    IMPORTANT: All inputs should be YX, not XY.
+
+    `margin` if provided, will subtract a margin along overlapping edges of each tile;
+        if not provided, this means that overlapping areas will be written multiple times;
+        if grid is regular, should be exactly half the overlap between tiles;
+        if grid is irregular, large values might lead to holes in output.
+    `area` can be any arbitrary geometry (i.e. need not be a rectangle)
+    `traversal_fnc` lets you define a custom grid traversal algorithm, a callable with:
+        traversal_fnc(grid, add_load_step, add_unload_step, add_write_step)
+        Which decides when to load which tiles, when to unload them, and when to write them.
+        Doesn't need to worry about whether those grid tiles are actually possible or not.
+
+    Returns:
+        plan (list[Step]): Describes how to manage the cache, and when/how to write tiles.
+            Steps can be load, unload or write.
+    """
+    if area is None:
+        area = shapely.unary_union(grid)
+        _, _, gyhi, gxhi = area.bounds
+
+    # Determine grid boundaries and which cells are possible
+    gh, gw = grid.shape[:2]
+    grid_in_area = shapely.intersects(grid, area)
+    gridcell_needed = calc_gridcell_needed(grid_in_area)
+
+    plan = []
+    weight_cache = {}
+
+    # By pushing these to helper functions we separate the traversal logic from
+    # deciding to load/unload/write only for tiles that need it (based on provided area)
+    def _in_bounds(gy, gx):
+        return 0 <= gy < gh and 0 <= gx < gw and grid[gy, gx] is not None
+
+    def _add_load_step(gy, gx):
+        if _in_bounds(gy, gx) and gridcell_needed[gy, gx]:
+            plan.append(LoadStep(action="load", index=(gy, gx), geom=grid[gy, gx]))
+
+    def _add_unload_step(gy, gx):
+        if _in_bounds(gy, gx) and gridcell_needed[gy, gx]:
+            plan.append(Step(action="unload", index=(gy, gx)))
+
+    def _calc_weight(gy, gx, geom, dir_mask):
+        # Check which directions are within the grid
+        nearby = [(int(gy + j), int(gx + i)) for j, i in GRID_DIR[dir_mask]]
+        nearby_geom = np.array([grid[y, x] for y, x in nearby])
+        # Based on which directions have a tile, determine how to trim the output
+        trim_bounds = get_trimmed_bounds(margin, GRID_DIR[dir_mask])
+
+        # Only create new weights if we have to
+        cache_hash = _mk_cache_hash(geom, dir_mask, nearby_geom)
+        if cache_hash in weight_cache:
+            # All but one of the weights are relative. The absolute output is the out_geom.
+            # So, here we account for a different input geom after-the-fact.
+            (out_geom, a, b, c, d), other_geom = weight_cache[cache_hash]
+            oylo, oxlo, _, _ = other_geom.bounds
+            tylo, txlo, _, _ = geom.bounds
+            out_geom = shapely.affinity.translate(out_geom, tylo - oylo, txlo - oxlo)
+            return (out_geom, a, b, c, d), nearby
+
+        # Finally calculate the weights for combining this tile with its nearby.
+        weight = overlap_weights(geom, nearby_geom, trim_bounds)
+        weight_cache[cache_hash] = (weight, geom)
+        return weight, nearby
+
+    def _add_write_step(gy, gx):
+        if grid_in_area[gy, gx]:
+            geom = grid[gy, gx]
+            dir_mask = np.asarray([_in_bounds(gy + j, gx + i) for j, i in GRID_DIR])
+            weight, nearby = _calc_weight(gy, gx, geom, dir_mask)
+            base = {"geom": geom, "index": (gy, gx), "weight": weight}
+            plan.append(WriteStep(action="write", **base, nearby=nearby))
+
+    traversal_fnc(grid, _add_load_step, _add_unload_step, _add_write_step)
+
+    return plan
+
+
+def plan_regular_grid(
+    image_size: tuple[int, int],
+    tile_size: tuple[int, int],
+    overlap: tuple[int, int],
+    area: shapely.Geometry = None,
+    traversal_fnc: callable = row_by_row_traversal,
+) -> tuple[list[Step], np.ndarray[shapely.Geometry]]:
+    """
+    Plans out running segmentation over a single large image by tiling, overlapping
+    and blending between adjacent tiles in a regular grid.
+
+    IMPORTANT: All inputs should be YX, not XY.
+
+    Does not depend on any real data; merely creates a geometry plan based on size data.
+
+    `area` can be any arbitrary geometry (i.e. need not be a rectangle)
+    `traversal_fnc` lets you define a custom grid traversal algorithm, a callable with:
+        traversal_fnc(grid, add_load_step, add_unload_step, add_write_step)
+        Which decides when to load which tiles, when to unload them, and when to write them.
+        Doesn't need to worry about whether those grid tiles are actually possible or not.
+
+    Returns:
+        plan (list[Step]): Describes how to manage the cache, and when/how to write tiles.
+            Steps can be load, unload or write.
+        grid (np.ndarray[shapely.Geometry]): shaped [H, W], a grid of geometries describing
+            where each tile is placed within the image.
+    """
+    oh, ow = overlap
+    if not (oh % 2 == 0 and ow % 2 == 0):
+        raise ValueError("Overlap must be an even number")
+    margin = int(oh // 2), int(ow // 2)
+    grid = regular_grid(image_size, tile_size, overlap, area)
+    return plan_from_grid(grid, margin, area, traversal_fnc), grid
+
+
+def batched_tile_get(
+    geoms: list[tuple[tuple[int, int], shapely.Geometry]],
+    batch_size: int,
+    get_tiles_fnc: callable,
+):
+    """
+    Takes some function to get tiles `get_tiles_fnc` which is to expect a batch of geoms at once.
+    Yields individual tiles
+    """
+    batch_indices = []
+    batch_geoms = []
+    for index, geom in geoms:
+        batch_indices.append(index)
+        batch_geoms.append(geom)
+        if len(batch_geoms) == batch_size:
+            tiles = get_tiles_fnc(batch_indices, batch_geoms)
+            for past_index, tile in zip(batch_indices, tiles):
+                yield tile
+            batch_indices = []
+            batch_geoms = []
+    tiles = get_tiles_fnc(batch_indices, batch_geoms)
+    for past_index, tile in zip(batch_indices, tiles):
+        yield tile
+
+
+def threaded_batched_tile_get(
+    geoms: list[tuple[tuple[int, int], shapely.Geometry]],
+    batch_size: int,
+    get_tiles_fnc: callable,
+    max_prefetched: int,
+) -> Generator[tuple[tuple[int, int], np.ndarray], None, None]:
+    """
+    Takes some function to get tiles `get_tiles_fnc` which is to expect a batch of geoms at once.
+    Executes that function in a thread, prefetching those tiles before they are needed.
+    Yields individual tiles
+    """
+    out_queue = queue.Queue(max_prefetched)
+
+    def _wrap_queue():
+        for tile in batched_tile_get(geoms, batch_size, get_tiles_fnc):
+            out_queue.put(tile)
+
+    thread = threading.Thread(target=_wrap_queue)
+    thread.start()
+    for _ in geoms:
+        yield out_queue.get()
+
+
+def analyse_plan(plan: list[Step]) -> tuple[int, int, int]:
+    """Counts maximum tiles loaded at once, total tiles loaded, and total write calls."""
+    loaded = 0
+    total_loaded = 0
+    max_loaded = 0
+    write = 0
+    for step in plan:
+        if step.action == "load":
+            loaded += 1
+            total_loaded += 1
+        elif step.action == "unload":
+            loaded -= 1
+        if loaded > max_loaded:
+            max_loaded = loaded
+        if step.action == "write":
+            write += 1
+    return max_loaded, total_loaded, write
+
+
+def get_plan_logit_geoms(plan):
+    return [(step.index, step.geom) for step in plan if step.action == "load"]
+
+
+def simple_logit_generator(plan, get_logits):
+    for index, geom in get_plan_logit_geoms(plan):
+        yield get_logits(geom)
+
+
+def _check_plan_doesnt_exceed(plan, max_tiles):
+    if max_tiles is None:
+        # No maximum set
+        return
+
+    max_loaded, _, _ = analyse_plan(plan)
+    if max_loaded > max_tiles:
+        raise Exception("Traversal method in plan would hold more than max tiles in memory")
+
+
+def noop(*args, **kwargs):
+    pass
+
+
+def serialise_index(index):
+    return f"{index[0]}-{index[1]}.npy"
+
+
+def run_plan(
+    plan: list[Step],
+    tiles: Iterable,
+    max_tiles: int = None,
+    disk_cache_dir: Path = None,
+    on_load: callable = noop,
+    on_unload: callable = noop,
+    on_step: callable = noop,
+    on_disk_evict: callable = noop,
+    on_disk_restore: callable = noop,
+) -> Generator[tuple[tuple[int, int], shapely.Geometry, np.ndarray], None, None]:
+    """
+    Executes a previously created plan to read model logits, and blend them together seamlessly.
+
+    Yields output geometries and tiles.
+
+    The on_* hooks are provided indexes into the grid used to generate the plan.
+
+    Args:
+        plan (list[Step]):
+            List of steps to execute.
+        tiles (Iterable[np.ndarray]): Iterable of tiles containing model logits.
+            Order must be as specified by seamless_seg.get_plan_logit_geoms
+        max_tiles (int):
+            Maximum number of tiles to keep in memory at once.
+        disk_cache_dir (Path):
+            If plan would load more than `max_tiles`; stores them to disk in this directory.
+        on_load (callable[tuple[int, int]->None]):
+            Called after a new tile is loaded into memory.
+        on_unload (callable[tuple[int, int]->None]):
+            Called after a tile is removed from memory.
+        on_step (callable[int->None]):
+            Called after each Step is executed. Is given step number, not grid index.
+        on_disk_evict (callable(tuple[int, int]->None)):
+            Called when a tile is stored to disk cache.
+        on_disk_restore (callable(tuple[int, int]->None)):
+            Called when a tile is restored from disk cache.
+
+    Yields:
+        index: tuple[int, int], out_geom: shapely.Geometry, out_tile: np.ndarray
+    """
+    cache = collections.OrderedDict()
+    disk_cache = {}
+
+    if max_tiles is not None and max_tiles <= 8:
+        raise ValueError("If provided, max_tiles must be greater than 8")
+
+    if disk_cache_dir is None:
+        _check_plan_doesnt_exceed(plan, max_tiles)
+    else:
+        if max_tiles is None:
+            raise ValueError("If disk_cache_dir is set, then max_tiles should be set")
+        disk_cache_dir.mkdir(exist_ok=True, parents=True)
+
+    # Two-level cache management functions; evicting to disk and restoring from disk.
+    def _evict_oldest():
+        oldest_index, oldest_tile = cache.popitem(False)
+        on_disk_evict(oldest_index)
+        fpath = disk_cache_dir / serialise_index(oldest_index)
+        np.save(fpath, oldest_tile)
+        disk_cache[oldest_index] = fpath
+
+    def _resolve_restore(index):
+        if index in cache:
+            cache.move_to_end(index)
+            return cache[index]
+        if len(cache) == max_tiles:
+            _evict_oldest()
+        cache[index] = np.load(disk_cache[index])
+        on_disk_restore(index)
+        del disk_cache[index]
+        return cache[index]
+
+    # Run plan
+    for n, step in enumerate(plan):
+        if step.action == "load":
+            # Put tile into cache
+            if disk_cache_dir is not None:
+                if len(cache) == max_tiles:
+                    _evict_oldest()
+            cache[step.index] = next(tiles)
+            on_load(step.index)
+        elif step.action == "unload":
+            # Remove tile from cache
+            del cache[step.index]
+            on_unload(step.index)
+        elif step.action == "write":
+            # Collect nearby tiles
+            nearby_tiles = []
+            for index in step.nearby:
+                if disk_cache_dir is None:
+                    tile = cache[index]
+                else:
+                    tile = _resolve_restore(index)
+                nearby_tiles.append(tile)
+
+            # Collect central tile
+            if disk_cache_dir is None:
+                central_tile = cache[step.index]
+            else:
+                central_tile = _resolve_restore(step.index)
+
+            # Apply weights from plan to create final output tile
+            out_geom, out_tile = apply_weights(central_tile, nearby_tiles, step.weight)
+            yield step.index, out_geom, out_tile
+        else:
+            raise Exception("Unknown plan action")
+        on_step(n)
+
+
+def pytorch_outputs_generator(plan, model, read_tile, batch_size: int = None, device: str = None):
+    import torch
+
+    if device is None:
+        if isinstance(model, torch.nn.Module):
+            device = next(model.parameters()).device
+        elif getattr(model, "device") is not None:
+            device = getattr(model, "device")
+        else:
+            device = "cpu"
+    else:
+        device = device
+
+    if batch_size is not None and batch_size >= 1:
+
+        def _run_tiles(_, geoms):
+            """A function which takes a batch of geoms and returns model outputs for those geoms"""
+            # Load all images for batch
+            imgs = [read_tile(in_geom) for in_geom in geoms]
+
+            # Push batch through model
+            img_th = torch.as_tensor(np.stack(imgs)).to(device)
+            out_th = model(img_th)
+            out = out_th.detach().cpu().numpy()
+
+            # model output is in BCHW, yield model outputs in BHWC
+            return out.transpose((0, 2, 3, 1))
+
+        def _input_generator(plan):
+            geoms = get_plan_logit_geoms(plan)
+            return threaded_batched_tile_get(geoms, batch_size, _run_tiles, batch_size * 3)
+
+    else:
+
+        def _input_generator(plan):
+            for index, in_geom in get_plan_logit_geoms(plan):
+                # Read image data
+                img = read_tile(in_geom)
+
+                # Push image data through model (don't forget batch dimension)
+                img_th = torch.as_tensor(img[None]).to(device)
+                out_th = model(img_th)
+                out = out_th[0].detach().cpu().numpy()
+
+                # Yield model outputs in HWC
+                yield out.transpose((1, 2, 0))
+
+    return _input_generator(plan)
+
+
+def run_plan_pytorch(
+    plan: list[Step],
+    model: callable,
+    read_tile: callable,
+    write_tile: callable,
+    batch_size: int = None,
+    max_tiles: int = None,
+    disk_cache_dir: Path = None,
+    device: str = None,
+):
+    in_tiles = pytorch_outputs_generator(plan, model, read_tile, batch_size, device)
+    out_tiles = run_plan(plan, in_tiles, max_tiles=max_tiles, disk_cache_dir=disk_cache_dir)
+    for index, out_geom, out_tile in out_tiles:
+        write_tile(out_geom, out_tile)
+
+
+def pytorch_rasterio(
+    model: callable,
+    in_tif,  # rasterio.Dataset
+    out_fname: str,
+    tile_size: tuple[int, int],
+    overlap: tuple[int, int] = None,
+    batch_size: int = None,
+    area: shapely.Geometry = None,
+    area_in_crs: bool = True,
+    max_tiles: int = None,
+    disk_cache_dir: Path = None,
+    device: str = None,
+):
+    """
+    Create a seamless segmentation in `out_tif`.
+    Takes image data from `in_tif`, runs it through `model` to produce logits,
+    uses seamless_seg to create segmentation and writes to `out_tif`.
+
+    Args:
+        in_tif: rasterio.Dataset
+        out_fname: str
+            Should be uint8 type for segmentation
+        tile_size: int | tuple[int, int]
+            Size of input to model
+        model: callable[torch.Tensor -> torch.Tensor]
+            Takes batch of image data, returns logits for the same shape
+        batch_size: int, Optional
+            If provided and greater than 1, runs model in batches of this size
+        overlap: int | tuple[int, int], Optional
+            Pixel overlap between tiles; larger overlap causes more gradual change, but is more expensive.
+            Optional: default is half maximum to balance speed and performance.
+        area: shapely.Geometry, Optional
+            Only run the model on a subset of the in_tif
+        area_in_crs: bool, Optional
+            If True (default) assumes `area` is in CRS of `in_tif`.
+            If False assumes `area` is in pixels.
+        max_tiles: int, Optional
+            To control memory footprint, you can set a maximum number of tiles to load at once.
+        disk_cache_dir: Path, Optional
+            When used in conjunction with max_tiles, will cache logits to disk during computation.
+        device: str, Optional
+            If provided, puts tiles onto device. Else attempts to read device from model. Else crashes.
+
+    """
+    import rasterio
+
+    profile = {
+        **in_tif.profile,
+        "dtype": np.uint8,
+        "count": 1,
+        "PHOTOMETRIC": "MINISBLACK",
+        "COMPRESS": "PACKBITS",
+    }
+    with rasterio.open(out_fname, "w", **profile) as out_tif:
+        if isinstance(tile_size, int):
+            tile_size = (tile_size,) * 2
+        if isinstance(overlap, int):
+            overlap = (overlap,) * 2
+
+        def read_tile(shp):
+            img = in_tif.read(window=shape_to_slices(shp))
+            return img
+
+        def write_tile(shp, tile):
+            # Convert logits to segmentation mask
+            seg = tile.argmax(axis=-1)[None]
+            # Write segmentation mask to disk
+            out_tif.write(seg, window=shape_to_slices(shp))
+
+        if overlap is None:
+            overlap = tile_size[0] // 4, tile_size[1] // 4
+        if area is not None and area_in_crs:
+            coords = shapely.get_coordinates(area)
+            in_tif.transform.itransform(coords)
+            area = shapely.set_coordinates(area, coords)
+
+        plan, grid = plan_regular_grid(in_tif.shape, tile_size, overlap, area=area)
+        run_plan_pytorch(
+            plan, model, read_tile, write_tile, batch_size, max_tiles, disk_cache_dir, device
+        )
+
+
+def pytorch_numpy(
+    model: callable,
+    img: np.ndarray,
+    tile_size: int | tuple[int, int],
+    overlap: int | tuple[int, int] = None,
+    batch_size: int = None,
+    max_tiles: int = None,
+    disk_cache_dir: Path = None,
+    device: str = None,
+):
+    """
+    Create a seamless segmentation of `img` using `model`.
+    Takes tiles from `img`, runs it through `model` to produce logits, and
+    uses seamless_seg to create segmentation, returning the img array.
+
+    Args:
+        model: callable[torch.Tensor -> torch.Tensor]
+            Takes batch of image data, returns logits for the same shape
+        img: np.ndarray
+            Shaped [C, H, W]
+        tile_size: int | tuple[int, int]
+            Size of input to model (H, W)
+        batch_size: int
+            If provided and greater than 1, runs model in batches of this size
+        overlap: int | tuple[int, int]
+            Pixel overlap between tiles; larger overlap causes more gradual change, but is more expensive.
+            Optional: default is half maximum to balance speed and performance.
+        area: shapely.Geometry
+            Only run the model on a subset of the in_tif
+        area_in_crs: bool
+            If True (default) assumes `area` is in CRS of `in_tif`.
+            If False assumes `area` is in pixels.
+        max_tiles: int
+            To control memory footprint, you can set a maximum number of tiles to load at once.
+        disk_cache_dir: Path
+            When used in conjunction with max_tiles, will cache logits to disk during computation.
+        device: str, Optional
+            If provided, processes tiles on device. Else attempts to read device from model. Else crashes.
+
+    """
+    out = np.zeros(img.shape[1:], dtype=np.int32)
+
+    if isinstance(tile_size, int):
+        tile_size = (tile_size,) * 2
+    if isinstance(overlap, int):
+        overlap = (overlap,) * 2
+
+    def read_tile(shp):
+        full_slice = (slice(None), *shape_to_slices(shp))
+        return img[full_slice]
+
+    def write_tile(shp, tile):
+        slc = shape_to_slices(shp)
+        # Convert logits to segmentation mask and write to out
+        out[slc] = tile.argmax(axis=-1)
+
+    if overlap is None:
+        overlap = tile_size[0] // 4, tile_size[1] // 4
+
+    plan, grid = plan_regular_grid(img.shape[1:], tile_size, overlap)
+    run_plan_pytorch(
+        plan, model, read_tile, write_tile, batch_size, max_tiles, disk_cache_dir, device
+    )
+
+    return out
