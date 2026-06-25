@@ -206,8 +206,8 @@ requires = ["uv_build>=0.8.22,<0.9.0"]
 build-backend = "uv_build"
 
 [tool.uv.build-backend]
+module-root = "."
 module-name = "instageo"
-module-root = ""
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
